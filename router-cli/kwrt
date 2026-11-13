@@ -848,7 +848,7 @@ kwrt —— Kwrt / OpenWrt 管理 CLI (AI 友好, 默认输出 JSON)
   kwrt -t clients                    # 终端表格
   kwrt logs 30 openclash             # 看 clash 日志
   kwrt uci get network.lan.ipaddr
-  kwrt uci set network.lan.ipaddr=10.235.1.2 -y && kwrt uci commit network -y
+  kwrt uci set network.lan.ipaddr=<NEW_LAN_IP> -y && kwrt uci commit network -y
   kwrt reboot -y
 EOT
 }

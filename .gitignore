@@ -18,3 +18,4 @@ __pycache__/
 
 # 内部协作文档（不入库）
 router-cli/Lyn-交互约定.md
+router-cli/交付记录-*.md

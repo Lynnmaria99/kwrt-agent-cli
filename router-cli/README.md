@@ -1,16 +1,17 @@
 # kwrt —— Kwrt 软路由 AI 管理 CLI
 
-一个装在路由上的零依赖命令行工具，把 `ubus` / `uci` / `iwinfo` / `logread` 这些底层接口
-包装成**结构化 JSON**，让 AI（或脚本）不用记参数就能管理路由器。人类使用时加 `-t` 看表格。
+一个装在 OpenWrt 系路由器上的零依赖命令行工具，把 `ubus` / `uci` / `iwinfo` / `logread`
+这些底层接口包装成**结构化 JSON**，让 AI（或脚本）不用记参数就能管理路由器。
+人类使用时加 `-t` 看表格。
 
-- 设备：Cudy TR3000 v2（Kwrt 24.10-SNAPSHOT，kernel 6.6.92，aarch64）
-- 路由器地址：`10.235.1.1`
+- 设备：OpenWrt 系软路由（具体型号由目标环境提供）
+- 路由器地址：`<ROUTER_HOST>`
 - 安装位置：`/etc/kwrt/kwrt`，通过软链接暴露为 `/usr/sbin/kwrt`
   （放在 `/etc` 下是为了 `sysupgrade` 刷机时能随配置保留）
 
 ## 一、连接方式
 
-本机已配好免密登录，直接：
+如果目标环境已经配置 SSH 别名，可直接：
 
 ```bash
 ssh router kwrt info          # JSON
@@ -22,9 +23,9 @@ ssh router                    # 进交互 shell
 
 ```
 Host router kwrt
-    HostName 10.235.1.1
+    HostName <ROUTER_HOST>
     User root
-    IdentityFile ~/.ssh/id_ed25519_router
+    IdentityFile <ROUTER_KEY_PATH>
 ```
 
 > 你之后修改 root 密码不会影响这条免密通道（走的是密钥认证）。
@@ -59,7 +60,7 @@ Host router kwrt
 ### 写操作（必须 `-y`）
 
 ```bash
-kwrt uci set network.lan.ipaddr=10.235.1.2 -y   # 也支持 kwrt uci set <键> <值>
+kwrt uci set network.lan.ipaddr=<NEW_LAN_IP> -y   # 也支持 kwrt uci set <键> <值>
 kwrt uci commit network -y                      # 提交生效
 kwrt uci revert network -y                      # 丢弃未提交改动
 kwrt uci delete <键> -y
@@ -97,12 +98,11 @@ ssh router kwrt logs 100 dnsmasq
 
 ## 五、本次顺带修复的问题
 
-**opkg 软件源全部 404**：固件里 `/etc/opkg/distfeeds.conf` 指向 `releases/24.10/`，
+**opkg 软件源全部 404**：部分固件的 `/etc/opkg/distfeeds.conf` 可能指向旧版本路径，
 而上游只有 `releases/24.10.0/`。已改为官方 24.10.0 路径，现在 `opkg update` 正常，
 可用包约 8990 个。原文件备份在 `/etc/opkg/distfeeds.conf.bak.20261114`。
 
-其中 `kwrt_kiddin9`（厂商专有源）地址本身就是死链，已注释掉；若以后需要厂商包，
-需向 Kwrt 作者确认新地址。
+如果某个厂商专有源失效，应先确认新地址，不要盲目替换为不明来源的软件源。
 
 ## 六、注意事项
 
