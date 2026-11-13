@@ -1,0 +1,900 @@
+#!/bin/sh
+# ==============================================================================
+#  kwrt —— AI 友好的 Kwrt / OpenWrt 管理 CLI
+#
+#  设计目标：让 AI（或脚本）用一条命令拿到结构化 JSON，不必记 ubus 参数。
+#  零依赖：只用固件自带的 busybox / ubus / uci / iwinfo / jsonfilter / nft / curl
+#  约定：
+#    * 默认输出 JSON（机器可读）；加 -t 输出人类可读文本
+#    * 只读命令随时可跑；写操作必须加 -y 或 KWRT_YES=1
+#  用法：kwrt help
+# ==============================================================================
+
+KWRT_VERSION="1.0.0"
+YES="${KWRT_YES:-0}"
+TEXT=0
+LEASES="/tmp/dhcp.leases"
+
+# ---------------------------------------------------------------- 输出辅助 ----
+
+# JSON 字符串转义（去换行/制表，转义反斜杠与双引号）
+jesc() {
+  printf '%s' "${1-}" | tr -d '\r' | tr '\t\n' '  ' \
+    | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# 字符串 -> JSON 值；空值输出 null
+jstr() {
+  if [ -n "${1-}" ]; then printf '"%s"' "$(jesc "$1")"; else printf 'null'; fi
+}
+
+# 数字 -> JSON 值；支持负号与小数点，非数字输出 null
+jnum() {
+  _v="${1-}"
+  [ -z "$_v" ] || [ "$_v" = "-" ] && { printf 'null'; return 0; }
+  case "$_v" in
+    -*) _abs="${_v#-}" ;;
+    +*) _abs="${_v#+}" ;;
+    *) _abs="$_v" ;;
+  esac
+  case "$_abs" in
+    '' | . | *[!0-9.]*) printf 'null' ;;
+    *.*.*) printf 'null' ;;
+    *) printf '%s' "$_v" ;;
+  esac
+}
+
+die() { printf '{"error":"%s"}\n' "$(jesc "$*")" >&2; exit 1; }
+
+require_yes() {
+  [ "$YES" = "1" ] && return 0
+  for a in "$@"; do
+    case "$a" in -y | --yes) return 0 ;; esac
+  done
+  printf '{"error":"need_confirmation","detail":"该命令会修改路由器，请加 -y 确认"}\n' >&2
+  exit 3
+}
+
+# 秒 -> 人类可读时长
+human_up() {
+  _s="${1:-0}"
+  _d=$((_s / 86400))
+  _h=$(((_s % 86400) / 3600))
+  _m=$(((_s % 3600) / 60))
+  if [ "$_d" -gt 0 ]; then printf '%dd %dh %dm' "$_d" "$_h" "$_m"
+  elif [ "$_h" -gt 0 ]; then printf '%dh %dm' "$_h" "$_m"
+  else printf '%dm' "$_m"; fi
+}
+
+# ---------------------------------------------------------------- 数据采集 ----
+
+iface_field() { # iface_field <iface> <jsonfilter-expr>
+  ubus call "network.interface.$1" status 2>/dev/null | jsonfilter -e "$2" 2>/dev/null
+}
+
+wifi_devices() { ubus call iwinfo devices 2>/dev/null | jsonfilter -e '@["devices"][*]' 2>/dev/null; }
+
+wifi_ssid() { # wifi_ssid <device>
+  ubus call iwinfo info "{\"device\":\"$1\"}" 2>/dev/null | jsonfilter -e '@.ssid' 2>/dev/null
+}
+
+mem_mb() { awk -v k="$1:" '$1==k{print int($2/1024)}' /proc/meminfo 2>/dev/null; }
+
+disk_line() { df -k / 2>/dev/null | awk 'NR>1{print $2" "$3" "$4; exit}'; }
+
+temp_c() {
+  _t=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null)
+  [ -z "$_t" ] && return 0
+  awk -v t="$_t" 'BEGIN{printf "%.1f", t/1000}'
+}
+
+wifi_client_count() {
+  _n=0
+  for _d in $(wifi_devices); do
+    _c=$(ubus call iwinfo assoclist "{\"device\":\"$_d\"}" 2>/dev/null | jsonfilter -e '@["results"][*].mac' 2>/dev/null | grep -c . )
+    _n=$((_n + ${_c:-0}))
+  done
+  echo "$_n"
+}
+
+lease_count() { [ -f "$LEASES" ] && grep -c . "$LEASES" || echo 0; }
+
+# ---------------------------------------------------------------- 系统信息 ----
+
+cmd_info() {
+  DISTRIB_ID=""; DISTRIB_RELEASE=""; DISTRIB_REVISION=""
+  DISTRIB_TARGET=""; DISTRIB_ARCH=""; DISTRIB_DESCRIPTION=""
+  [ -f /etc/openwrt_release ] && . /etc/openwrt_release
+
+  _hn=$(cat /proc/sys/kernel/hostname 2>/dev/null)
+  _model=$(cat /tmp/sysinfo/model 2>/dev/null)
+  _board=$(cat /tmp/sysinfo/board_name 2>/dev/null)
+  _kern=$(uname -r 2>/dev/null)
+  _up=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+  _load=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)
+  _l1=$(printf '%s' "$_load" | cut -d' ' -f1)
+  _l5=$(printf '%s' "$_load" | cut -d' ' -f2)
+  _l15=$(printf '%s' "$_load" | cut -d' ' -f3)
+  _mt=$(mem_mb MemTotal); _ma=$(mem_mb MemAvailable)
+  _mu=$(( ${_mt:-0} - ${_ma:-0} ))
+  _dl=$(disk_line)
+  _dt=$(( $(printf '%s' "$_dl" | cut -d' ' -f1) / 1024 ))
+  _du=$(( $(printf '%s' "$_dl" | cut -d' ' -f2) / 1024 ))
+  _df=$(( $(printf '%s' "$_dl" | cut -d' ' -f3) / 1024 ))
+  _tc=$(temp_c)
+  _lan=$(iface_field lan '@["ipv4-address"][0].address')
+  _wan=$(iface_field wan '@["ipv4-address"][0].address')
+  _wandev=$(iface_field wan '@.device')
+
+  if [ "$TEXT" = "1" ]; then
+    printf '%s %s (%s)  [%s]\n' "$DISTRIB_ID" "$DISTRIB_RELEASE" "$DISTRIB_REVISION" "$_model"
+    printf '  主机名   : %-22s 内核 : %s (%s)\n' "$_hn" "$_kern" "$DISTRIB_ARCH"
+    printf '  运行时长 : %s (%s 秒)\n' "$(human_up "$_up")" "$_up"
+    printf '  负载     : %s / %s / %s\n' "$_l1" "$_l5" "$_l15"
+    printf '  内存     : %s / %s MB (可用 %s MB)\n' "$_mu" "$_mt" "$_ma"
+    printf '  磁盘     : %s / %s MB (可用 %s MB)\n' "$_du" "$_dt" "$_df"
+    printf '  温度     : %s °C\n' "${_tc:-N/A}"
+    printf '  LAN      : %s\n' "${_lan:-N/A}"
+    printf '  WAN      : %s (%s)\n' "${_wan:-N/A}" "${_wandev:-N/A}"
+    printf '  无线终端 : %s     DHCP 租约 : %s\n' "$(wifi_client_count)" "$(lease_count)"
+    return 0
+  fi
+
+  printf '{\n'
+  printf '  "hostname": %s,\n' "$(jstr "$_hn")"
+  printf '  "model": %s,\n' "$(jstr "$_model")"
+  printf '  "board": %s,\n' "$(jstr "$_board")"
+  printf '  "kernel": %s,\n' "$(jstr "$_kern")"
+  printf '  "arch": %s,\n' "$(jstr "$DISTRIB_ARCH")"
+  printf '  "distribution": %s,\n' "$(jstr "$DISTRIB_ID")"
+  printf '  "version": %s,\n' "$(jstr "$DISTRIB_RELEASE")"
+  printf '  "revision": %s,\n' "$(jstr "$DISTRIB_REVISION")"
+  printf '  "target": %s,\n' "$(jstr "$DISTRIB_TARGET")"
+  printf '  "uptime_seconds": %s,\n' "$(jnum "$_up")"
+  printf '  "uptime_human": %s,\n' "$(jstr "$(human_up "$_up")")"
+  printf '  "load": {"1m": %s, "5m": %s, "15m": %s},\n' "$(jnum "$_l1")" "$(jnum "$_l5")" "$(jnum "$_l15")"
+  printf '  "memory_mb": {"total": %s, "used": %s, "available": %s},\n' "$(jnum "$_mt")" "$(jnum "$_mu")" "$(jnum "$_ma")"
+  printf '  "disk_mb": {"total": %s, "used": %s, "available": %s},\n' "$(jnum "$_dt")" "$(jnum "$_du")" "$(jnum "$_df")"
+  printf '  "temperature_c": %s,\n' "$(jnum "$_tc")"
+  printf '  "lan_ip": %s,\n' "$(jstr "$_lan")"
+  printf '  "wan_ip": %s,\n' "$(jstr "$_wan")"
+  printf '  "wan_device": %s,\n' "$(jstr "$_wandev")"
+  printf '  "wifi_clients": %s,\n' "$(jnum "$(wifi_client_count)")"
+  printf '  "dhcp_leases": %s\n' "$(jnum "$(lease_count)")"
+  printf '}\n'
+}
+
+cmd_status() {
+  _up=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+  _load=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)
+  _mt=$(mem_mb MemTotal); _ma=$(mem_mb MemAvailable)
+  _dl=$(disk_line)
+  _df=$(( $(printf '%s' "$_dl" | cut -d' ' -f3) / 1024 ))
+  _tc=$(temp_c)
+  _wanup=$(iface_field wan '@.up')
+  _wc=$(wifi_client_count)
+  _lc=$(lease_count)
+
+  if [ "$TEXT" = "1" ]; then
+    printf '运行时长: %s   负载: %s\n' "$(human_up "$_up")" "$_load"
+    printf '内存可用: %s MB / %s MB   磁盘可用: %s MB   温度: %s °C\n' "$_ma" "$_mt" "$_df" "${_tc:-N/A}"
+    printf 'WAN 在线: %s   无线终端: %s   DHCP 租约: %s\n' "${_wanup:-unknown}" "$_wc" "$_lc"
+    return 0
+  fi
+
+  printf '{\n'
+  printf '  "uptime_seconds": %s,\n' "$(jnum "$_up")"
+  printf '  "load": "%s",\n' "$(jesc "$_load")"
+  printf '  "memory_available_mb": %s,\n' "$(jnum "$_ma")"
+  printf '  "memory_total_mb": %s,\n' "$(jnum "$_mt")"
+  printf '  "disk_available_mb": %s,\n' "$(jnum "$_df")"
+  printf '  "temperature_c": %s,\n' "$(jnum "$_tc")"
+  printf '  "wan_up": %s,\n' "${_wanup:-null}"
+  printf '  "wifi_clients": %s,\n' "$(jnum "$_wc")"
+  printf '  "dhcp_leases": %s\n' "$(jnum "$_lc")"
+  printf '}\n'
+}
+
+# ---------------------------------------------------------------- 网络 ----
+
+cmd_net() {
+  _names=$(ubus call network.interface dump 2>/dev/null | jsonfilter -e '@["interface"][*]["interface"]' 2>/dev/null)
+  _first=1
+  [ "$TEXT" = "1" ] && printf '%-8s %-7s %-6s %-10s %-16s %s\n' IFACE PROTO UP DEVICE ADDRESS UPTIME
+  [ "$TEXT" = "1" ] || printf '{"interfaces":['
+  for _n in $_names; do
+    _st=$(ubus call "network.interface.$_n" status 2>/dev/null)
+    _up=$(printf '%s' "$_st" | jsonfilter -e '@.up' 2>/dev/null)
+    _dev=$(printf '%s' "$_st" | jsonfilter -e '@.device' 2>/dev/null)
+    _proto=$(printf '%s' "$_st" | jsonfilter -e '@.proto' 2>/dev/null)
+    _ip=$(printf '%s' "$_st" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
+    _mask=$(printf '%s' "$_st" | jsonfilter -e '@["ipv4-address"][0].mask' 2>/dev/null)
+    _upt=$(printf '%s' "$_st" | jsonfilter -e '@.uptime' 2>/dev/null)
+    _rx=$(printf '%s' "$_st" | jsonfilter -e '@["statistics"]["rx_bytes"]' 2>/dev/null)
+    _tx=$(printf '%s' "$_st" | jsonfilter -e '@["statistics"]["tx_bytes"]' 2>/dev/null)
+    if [ "$TEXT" = "1" ]; then
+      printf '%-8s %-7s %-6s %-10s %-16s %s\n' "$_n" "${_proto:--}" "${_up:--}" \
+        "${_dev:--}" "${_ip:--}" "$(human_up "${_upt:-0}")"
+    else
+      [ "$_first" = "1" ] || printf ','
+      _first=0
+      printf '\n  {"name": %s, "proto": %s, "up": %s, "device": %s, "ipv4": %s, "mask": %s, "uptime_seconds": %s, "rx_bytes": %s, "tx_bytes": %s}' \
+        "$(jstr "$_n")" "$(jstr "$_proto")" "${_up:-null}" "$(jstr "$_dev")" \
+        "$(jstr "$_ip")" "$(jnum "$_mask")" "$(jnum "$_upt")" "$(jnum "$_rx")" "$(jnum "$_tx")"
+    fi
+  done
+  [ "$TEXT" = "1" ] && return 0
+  printf '\n]}\n'
+}
+
+cmd_route() {
+  if [ "$TEXT" = "1" ]; then
+    ip route show 2>/dev/null
+    return 0
+  fi
+  _first=1
+  printf '{"routes":['
+  ip route show 2>/dev/null | while IFS= read -r _l; do
+    [ -z "$_l" ] && continue
+    printf '%s{"raw": %s}' "$( [ "$_first" = "1" ] && echo '' || echo ',' )" "$(jstr "$_l")"
+    _first=0
+  done
+  printf ']}\n'
+}
+
+cmd_dns() {
+  _dom="$1"
+  [ -z "$_dom" ] && die "用法: kwrt dns <域名>"
+  _ns=$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf 2>/dev/null)
+  _out=$(nslookup "$_dom" 2>&1)
+  _ips=$(printf '%s\n' "$_out" | awk '
+    /^Address[ 0-9]*:/ {
+      v=$0; sub(/^Address[^:]*:[ \t]*/, "", v)
+      if (v ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print v
+    }' | sort -u | tr '\n' ' ')
+  if [ "$TEXT" = "1" ]; then
+    printf '域名: %s   服务器: %s\n' "$_dom" "${_ns:-unknown}"
+    if [ -n "$(printf '%s' "$_ips" | tr -d ' ')" ]; then
+      for i in $_ips; do printf '  %s\n' "$i"; done
+    else
+      printf '  解析失败\n'
+    fi
+    return 0
+  fi
+  _first=1
+  printf '{"domain": %s, "server": %s, "addresses": [' "$(jstr "$_dom")" "$(jstr "$_ns")"
+  for i in $_ips; do
+    [ "$_first" = "1" ] || printf ','
+    _first=0
+    printf '%s' "$(jstr "$i")"
+  done
+  printf '], "resolved": %s}\n' "$( [ -n "$(printf '%s' "$_ips" | tr -d ' ')" ] && echo true || echo false )"
+}
+
+cmd_ping() {
+  _host="$1"
+  _cnt="${2:-4}"
+  [ -z "$_host" ] && die "用法: kwrt ping <主机> [次数]"
+  _out=$(ping -c "$_cnt" -W 2 "$_host" 2>&1)
+  _tx=$(printf '%s\n' "$_out" | sed -n 's/^\([0-9]*\) packets transmitted.*/\1/p' | head -1)
+  _rx=$(printf '%s\n' "$_out" | sed -n 's/.*, \([0-9]*\) packets received.*/\1/p' | head -1)
+  _loss=$(printf '%s\n' "$_out" | sed -n 's/.*, \([0-9]*%\) packet loss.*/\1/p' | head -1)
+  _rtt=$(printf '%s\n' "$_out" | sed -n 's#.*min/avg/max = \([0-9./]*\).*#\1#p' | head -1)
+  if [ "$TEXT" = "1" ]; then
+    printf '目标: %s   发送: %s  接收: %s  丢包: %s\n' "$_host" "${_tx:-?}" "${_rx:-?}" "${_loss:-?}"
+    [ -n "$_rtt" ] && printf 'RTT(min/avg/max): %s ms\n' "$_rtt"
+    return 0
+  fi
+  printf '{"host": %s, "transmitted": %s, "received": %s, "loss": %s, "rtt_ms": %s}\n' \
+    "$(jstr "$_host")" "$(jnum "$_tx")" "$(jnum "$_rx")" "$(jstr "${_loss%%%}")" "$(jstr "$_rtt")"
+}
+
+# ---------------------------------------------------------------- 终端列表 ----
+
+cmd_clients() {
+  _tmp="/tmp/.kwrt_wifi.$$"
+  : > "$_tmp"
+  for _d in $(wifi_devices); do
+    _ssid=$(wifi_ssid "$_d")
+    _al=$(ubus call iwinfo assoclist "{\"device\":\"$_d\"}" 2>/dev/null)
+    _i=0
+    while :; do
+      _mac=$(printf '%s' "$_al" | jsonfilter -e "@[\"results\"][$_i].mac" 2>/dev/null)
+      [ -z "$_mac" ] && break
+      _sig=$(printf '%s' "$_al" | jsonfilter -e "@[\"results\"][$_i].signal" 2>/dev/null)
+      printf '%s|%s|%s|%s\n' "$(printf '%s' "$_mac" | tr 'A-Z' 'a-z')" "$_ssid" "$_sig" "$_d" >> "$_tmp"
+      _i=$((_i + 1))
+    done
+  done
+
+  if [ "$TEXT" = "1" ]; then
+    printf '%-16s %-18s %-18s %s\n' IP MAC HOSTNAME 连接
+    if [ -f "$LEASES" ]; then
+      while read -r _exp _mac _ip _host _cid; do
+        [ -z "$_mac" ] && continue
+        _w=$(awk -F'|' -v m="$_mac" '$1==m{print "wifi " $2 " " $3 "dBm"; exit}' "$_tmp")
+        [ "$_host" = "*" ] && _host="-"
+        printf '%-16s %-18s %-18s %s\n' "${_ip:--}" "$_mac" "${_host:--}" "${_w:-ethernet}"
+      done < "$LEASES"
+      cut -d' ' -f2 "$LEASES" 2>/dev/null | tr 'A-Z' 'a-z' | sort -u > "$_tmp.macs"
+    else
+      : > "$_tmp.macs"
+    fi
+    # 无线里没拿到 DHCP 租约的（静态 IP 设备）
+    awk -F'|' 'NR==FNR { seen[$1]=1; next } !($1 in seen) { printf "%-16s %-18s %-18s %s\n", "-", $1, "-", "wifi " $2 " " $3 "dBm" }' \
+      "$_tmp.macs" "$_tmp" 2>/dev/null
+    rm -f "$_tmp" "$_tmp.macs"
+    return 0
+  fi
+
+  _first=1
+  printf '{"count": %s, "clients": [' "$(lease_count)"
+  if [ -f "$LEASES" ]; then
+    while read -r _exp _mac _ip _host _cid; do
+      _w=$(awk -F'|' -v m="$_mac" '$1==m{print $2 "|" $3 "|" $4; exit}' "$_tmp")
+      _ssid=$(printf '%s' "$_w" | cut -d'|' -f1)
+      _sig=$(printf '%s' "$_w" | cut -d'|' -f2)
+      _dev=$(printf '%s' "$_w" | cut -d'|' -f3)
+      _now=$(cut -d. -f1 /proc/uptime)
+      _left=$(( ${_exp:-0} - $(date +%s) ))
+      [ "$_left" -lt 0 ] && _left=0
+      [ "$_first" = "1" ] || printf ','
+      _first=0
+      printf '\n    {"ip": %s, "mac": %s, "hostname": %s, "medium": %s, "ssid": %s, "signal_dbm": %s, "wifi_device": %s, "lease_expires_in": %s}' \
+        "$(jstr "$_ip")" "$(jstr "$_mac")" "$(jstr "$_host")" \
+        "$( [ -n "$_w" ] && echo '"wifi"' || echo '"ethernet"' )" \
+        "$(jstr "$_ssid")" "$(jnum "$_sig")" "$(jstr "$_dev")" "$(jnum "$_left")"
+    done < "$LEASES"
+  fi
+  # 无租约的无线终端
+  if [ -s "$_tmp" ]; then
+    [ -f "$LEASES" ] && cut -d' ' -f2 "$LEASES" 2>/dev/null | tr 'A-Z' 'a-z' | sort -u > "$_tmp.macs" || : > "$_tmp.macs"
+    awk -F'|' 'NR==FNR { seen[$1]=1; next } !($1 in seen) { print $0 }' "$_tmp.macs" "$_tmp" 2>/dev/null |
+      while IFS='|' read -r _mac _ssid _sig _dev; do
+        [ -z "$_mac" ] && continue
+        [ "$_first" = "1" ] || printf ','
+        _first=0
+        printf '\n    {"ip": null, "mac": %s, "hostname": null, "medium": "wifi", "ssid": %s, "signal_dbm": %s, "wifi_device": %s, "lease_expires_in": null}' \
+          "$(jstr "$_mac")" "$(jstr "$_ssid")" "$(jnum "$_sig")" "$(jstr "$_dev")"
+      done
+    rm -f "$_tmp.macs"
+  fi
+  printf '\n]}\n'
+  rm -f "$_tmp"
+}
+
+cmd_dhcp() {
+  if [ "$TEXT" = "1" ]; then
+    printf '%-16s %-18s %-18s %s\n' IP MAC HOSTNAME 剩余租期
+    while read -r _exp _mac _ip _host _cid; do
+      printf '%-16s %-18s %-18s %ss\n' "$_ip" "$_mac" "$_host" "$(( ${_exp:-0} - $(date +%s) ))"
+    done < "$LEASES" 2>/dev/null
+    return 0
+  fi
+  _first=1
+  printf '{"count": %s, "leases": [' "$(lease_count)"
+  if [ -f "$LEASES" ]; then
+    while read -r _exp _mac _ip _host _cid; do
+      [ "$_first" = "1" ] || printf ','
+      _first=0
+      _left=$(( ${_exp:-0} - $(date +%s) ))
+      [ "$_left" -lt 0 ] && _left=0
+      printf '\n  {"ip": %s, "mac": %s, "hostname": %s, "expires_in": %s}' \
+        "$(jstr "$_ip")" "$(jstr "$_mac")" "$(jstr "$_host")" "$(jnum "$_left")"
+    done < "$LEASES"
+  fi
+  printf '\n]}\n'
+}
+
+cmd_wifi() {
+  _first=1
+  [ "$TEXT" = "1" ] && printf '%-10s %-20s %-5s %-6s %-10s %s\n' DEVICE SSID CHANNEL BAND 加密 终端
+  [ "$TEXT" = "1" ] || printf '{"radios": ['
+  for _d in $(wifi_devices); do
+    _inf=$(ubus call iwinfo info "{\"device\":\"$_d\"}" 2>/dev/null)
+    _ssid=$(printf '%s' "$_inf" | jsonfilter -e '@.ssid' 2>/dev/null)
+    _ch=$(printf '%s' "$_inf" | jsonfilter -e '@.channel' 2>/dev/null)
+    _freq=$(printf '%s' "$_inf" | jsonfilter -e '@.frequency' 2>/dev/null)
+    _txp=$(printf '%s' "$_inf" | jsonfilter -e '@.txpower' 2>/dev/null)
+    _hw=$(printf '%s' "$_inf" | jsonfilter -e '@["hwmodes_text"]' 2>/dev/null)
+    _ht=$(printf '%s' "$_inf" | jsonfilter -e '@["htmode"]' 2>/dev/null)
+    _wpa=$(printf '%s' "$_inf" | jsonfilter -e '@["encryption"]["wpa"][0]' 2>/dev/null)
+    _auth=$(printf '%s' "$_inf" | jsonfilter -e '@["encryption"]["authentication"][0]' 2>/dev/null)
+    _n=$(ubus call iwinfo assoclist "{\"device\":\"$_d\"}" 2>/dev/null | jsonfilter -e '@["results"][*].mac' 2>/dev/null | grep -c .)
+    case "$_freq" in
+      24??) _band="2.4G" ;;
+      5???) _band="5G" ;;
+      6???) _band="6G" ;;
+      *) _band="?" ;;
+    esac
+    case "$_wpa" in
+      3) _enc="WPA3" ;;
+      2) _enc="WPA2" ;;
+      1) _enc="WPA" ;;
+      *) _enc="open" ;;
+    esac
+    [ -n "$_auth" ] && _enc="$_enc/$(printf '%s' "$_auth" | tr 'a-z' 'A-Z')"
+    if [ "$TEXT" = "1" ]; then
+      printf '%-10s %-20s %-5s %-6s %-10s %s\n' "$_d" "${_ssid:--}" "${_ch:--}" "$_band" "$_enc" "$_n"
+    else
+      [ "$_first" = "1" ] || printf ','
+      _first=0
+      printf '\n  {"device": %s, "ssid": %s, "channel": %s, "frequency_mhz": %s, "band": %s, "txpower_dbm": %s, "hwmodes": %s, "htmode": %s, "encryption": %s, "clients": %s}' \
+        "$(jstr "$_d")" "$(jstr "$_ssid")" "$(jnum "$_ch")" "$(jnum "$_freq")" \
+        "$(jstr "$_band")" "$(jnum "$_txp")" "$(jstr "$_hw")" "$(jstr "$_ht")" \
+        "$(jstr "$_enc")" "$(jnum "$_n")"
+    fi
+  done
+  [ "$TEXT" = "1" ] && return 0
+  printf '\n]}\n'
+}
+
+# ---------------------------------------------------------------- 服务 ----
+
+cmd_services() {
+  _first=1
+  [ "$TEXT" = "1" ] && printf '%-22s %-8s %s\n' SERVICE RUNNING ENABLED
+  [ "$TEXT" = "1" ] || printf '{"services": ['
+  for _s in $(ls /etc/init.d 2>/dev/null); do
+    _flags=$(ubus call service list "{\"name\":\"$_s\"}" 2>/dev/null | jsonfilter -e '@.*.instances[*].running' 2>/dev/null)
+    case "$_flags" in
+      *true*) _run="true" ;;
+      *) _run="false" ;;
+    esac
+    if ls /etc/rc.d/S[0-9]*"$_s" >/dev/null 2>&1; then _en="true"; else _en="false"; fi
+    if [ "$TEXT" = "1" ]; then
+      printf '%-22s %-8s %s\n' "$_s" "$_run" "$_en"
+    else
+      [ "$_first" = "1" ] || printf ','
+      _first=0
+      printf '\n  {"name": %s, "running": %s, "enabled": %s}' "$(jstr "$_s")" "$_run" "$_en"
+    fi
+  done
+  [ "$TEXT" = "1" ] && return 0
+  printf '\n]}\n'
+}
+
+cmd_svc() {
+  _act="$1"; _name="$2"
+  [ -z "$_act" ] || [ -z "$_name" ] && die "用法: kwrt svc <start|stop|restart|enable|disable|status> <服务名>"
+  [ ! -x "/etc/init.d/$_name" ] && die "服务不存在: $_name（用 kwrt services 查看）"
+  case "$_act" in
+    status)
+      _flags=$(ubus call service list "{\"name\":\"$_name\"}" 2>/dev/null | jsonfilter -e '@.*.instances[*].running' 2>/dev/null)
+      case "$_flags" in *true*) _r=true ;; *) _r=false ;; esac
+      [ "$TEXT" = "1" ] && { printf '%s: running=%s\n' "$_name" "$_r"; return 0; }
+      printf '{"service": %s, "running": %s}\n' "$(jstr "$_name")" "$_r"
+      return 0 ;;
+    start | stop | restart | enable | disable | reload) : ;;
+    *) die "不支持的动作: $_act" ;;
+  esac
+  require_yes "$@"
+  _out=$(/etc/init.d/"$_name" "$_act" 2>&1)
+  _rc=$?
+  [ "$TEXT" = "1" ] && { printf '%s %s -> rc=%s\n%s\n' "$_name" "$_act" "$_rc" "$_out"; return 0; }
+  printf '{"service": %s, "action": %s, "ok": %s, "rc": %s, "output": %s}\n' \
+    "$(jstr "$_name")" "$(jstr "$_act")" \
+    "$( [ "$_rc" = 0 ] && echo true || echo false )" "$_rc" "$(jstr "$_out")"
+}
+
+# ---------------------------------------------------------------- 防火墙/LAN ----
+
+cmd_firewall() {
+  _zones=$(uci show firewall 2>/dev/null | awk -F'=' '
+    {
+      key=$1; val=$0; sub(/^[^=]*=/, "", val); gsub(/^'\''|'\''$/, "", val)
+      n=split(key, a, ".")
+      sect=a[2]; att=a[3]
+      if (sect ~ /^@zone\[[0-9]+\]$/) {
+        if (!(sect in seen)) { order[++c]=sect; seen[sect]=1 }
+        z[sect, att]=val
+      }
+    }
+    END {
+      for (i=1; i<=c; i++) {
+        s=order[i]
+        if (i>1) printf ","
+        printf "\n    {\"name\": \"%s\", \"input\": \"%s\", \"output\": \"%s\", \"forward\": \"%s\", \"masq\": \"%s\", \"networks\": \"%s\"}",
+          z[s,"name"], z[s,"input"], z[s,"output"], z[s,"forward"], z[s,"masq"], z[s,"network"]
+      }
+    }')
+  _nrules=$(uci show firewall 2>/dev/null | grep -c '=rule$')
+  _nredir=$(uci show firewall 2>/dev/null | grep -c '=redirect$')
+  _nfwd=$(uci show firewall 2>/dev/null | grep -c '=forwarding$')
+
+  if [ "$TEXT" = "1" ]; then
+    printf '区域: %s\n' "$(uci show firewall 2>/dev/null | grep '@zone\[[0-9]*\].name' | sed "s/.*name='\([^']*\)'.*/\1/" | tr '\n' ' ')"
+    printf '规则: %s 条   端口转发: %s 条   区域转发: %s 条\n' "$_nrules" "$_nredir" "$_nfwd"
+    return 0
+  fi
+  printf '{"zones": [%s\n],"rules": %s, "redirects": %s, "forwardings": %s}\n' \
+    "$_zones" "$(jnum "$_nrules")" "$(jnum "$_nredir")" "$(jnum "$_nfwd")"
+}
+
+cmd_logs() {
+  _n="${1:-50}"
+  _pat="$2"
+  if [ -n "$_pat" ]; then
+    _raw=$(logread 2>/dev/null | grep -i -- "$_pat" | tail -n "$_n")
+  else
+    _raw=$(logread 2>/dev/null | tail -n "$_n")
+  fi
+  if [ "$TEXT" = "1" ]; then
+    printf '%s\n' "$_raw"
+    return 0
+  fi
+  printf '{"count": %s, "lines": [' "$(printf '%s\n' "$_raw" | grep -c .)"
+  _first=1
+  printf '%s\n' "$_raw" | while IFS= read -r _l; do
+    [ -z "$_l" ] && continue
+    [ "$_first" = "1" ] || printf ','
+    _first=0
+    printf '\n  %s' "$(jstr "$_l")"
+  done
+  printf '\n]}\n'
+}
+
+# ---------------------------------------------------------------- UCI ----
+
+cmd_uci() {
+  _sub="$1"; shift 2>/dev/null
+  # 过滤掉 -y/--yes，再取前两个位置参数，兼容 `set key value` 与 `set key=value` 两种写法
+  _a1=""; _a2=""
+  for _x in "$@"; do
+    case "$_x" in
+      -y | --yes) continue ;;
+    esac
+    if [ -z "$_a1" ]; then _a1="$_x"; elif [ -z "$_a2" ]; then _a2="$_x"; fi
+  done
+  case "$_sub" in
+    show)
+      _cfg="$_a1"
+      [ -z "$_cfg" ] && die "用法: kwrt uci show <配置>（如 network/firewall/wireless）"
+      if [ "$TEXT" = "1" ]; then uci show "$_cfg" 2>&1; return 0; fi
+      uci show "$_cfg" 2>/dev/null | awk -F'=' '
+        {
+          k=$1; v=$0; sub(/^[^=]*=/, "", v); gsub(/^'\''|'\''$/, "", v)
+          gsub(/\\/, "\\\\", v); gsub(/"/, "\\\"", v)
+          if (n++) printf ",\n"
+          printf "  \"%s\": \"%s\"", k, v
+        }
+        END { if (n) printf "\n" }' | {
+        printf '{"config": %s, "options": {\n' "$(jstr "$_cfg")"
+        cat
+        printf '}}\n'
+      }
+      ;;
+    get)
+      _key="$_a1"
+      [ -z "$_key" ] && die "用法: kwrt uci get <完整键名>（如 network.lan.proto）"
+      _v=$(uci -q get "$_key" 2>/dev/null)
+      if [ "$TEXT" = "1" ]; then printf '%s = %s\n' "$_key" "${_v:-<空>}"; return 0; fi
+      printf '{"key": %s, "value": %s, "exists": %s}\n' "$(jstr "$_key")" "$(jstr "$_v")" \
+        "$( [ -n "$_v" ] && echo true || echo false )"
+      ;;
+    set)
+      case "$_a1" in
+        *=*) _key="${_a1%%=*}"; _val="${_a1#*=}" ;;
+        *) _key="$_a1"; _val="$_a2" ;;
+      esac
+      [ -z "$_key" ] && die "用法: kwrt uci set <键> <值> 或 kwrt uci set <键>=<值>"
+      require_yes "$@"
+      if [ ! -f "/etc/config/${_key%%.*}" ]; then
+        die "配置文件不存在: /etc/config/${_key%%.*}（uci 无法凭空新建配置）"
+      fi
+      uci set "$_key=$_val" || die "uci set 失败: $_key（键名或配置段不存在？）"
+      printf '{"key": %s, "value": %s, "status": "set", "next": "kwrt uci commit <配置> -y"}\n' \
+        "$(jstr "$_key")" "$(jstr "$_val")"
+      ;;
+    delete)
+      _key="$_a1"
+      [ -z "$_key" ] && die "用法: kwrt uci delete <完整键名>"
+      require_yes "$@"
+      uci delete "$_key" || die "uci delete 失败: $_key"
+      printf '{"key": %s, "status": "deleted", "next": "kwrt uci commit <配置> -y"}\n' "$(jstr "$_key")"
+      ;;
+    commit)
+      _cfg="$_a1"
+      [ -z "$_cfg" ] && die "用法: kwrt uci commit <配置>"
+      require_yes "$@"
+      uci commit "$_cfg" || die "uci commit 失败: $_cfg"
+      printf '{"config": %s, "status": "committed"}\n' "$(jstr "$_cfg")"
+      ;;
+    revert)
+      _cfg="$_a1"
+      [ -z "$_cfg" ] && die "用法: kwrt uci revert <配置>"
+      require_yes "$@"
+      uci revert "$_cfg" || die "uci revert 失败: $_cfg"
+      printf '{"config": %s, "status": "reverted"}\n' "$(jstr "$_cfg")"
+      ;;
+    "")
+      die "用法: kwrt uci <show|get|set|delete|commit|revert> ..."
+      ;;
+    *)
+      die "未知 uci 子命令: $_sub"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------- 包管理 ----
+
+cmd_pkg() {
+  _sub="$1"; shift 2>/dev/null
+  case "$_sub" in
+    update)
+      _out=$(opkg update 2>&1)
+      _fail=$(printf '%s' "$_out" | grep -c 'Failed to download')
+      if [ "$TEXT" = "1" ]; then printf '%s\n' "$_out" | tail -20; return 0; fi
+      printf '{"status": %s, "failed_feeds": %s, "available": %s}\n' \
+        "$( [ "$_fail" = 0 ] && echo '"ok"' || echo '"partial"' )" "$_fail" \
+        "$(opkg list 2>/dev/null | grep -c .)"
+      ;;
+    search | list)
+      _pat="$1"
+      if [ "$TEXT" = "1" ]; then opkg list "${_pat:-\*}" 2>&1 | head -40; return 0; fi
+      printf '{"packages": ['
+      opkg list "${_pat:-\*}" 2>/dev/null | head -200 | awk -F' - ' '
+        NF >= 1 && $1 != "" {
+          if (n++) printf ","
+          v = (NF >= 2) ? $2 : ""
+          d = (NF >= 3) ? $3 : ""
+          gsub(/\\/, "\\\\", d); gsub(/"/, "\\\"", d)
+          printf "\n  {\"name\": \"%s\", \"version\": \"%s\", \"description\": \"%s\"}", $1, v, d
+        }
+        END { if (n) printf "\n" }'
+      printf ']}\n'
+      ;;
+    info)
+      _n="$1"
+      [ -z "$_n" ] && die "用法: kwrt pkg info <包名>"
+      if [ "$TEXT" = "1" ]; then opkg info "$_n" 2>&1 | head -25; return 0; fi
+      opkg info "$_n" 2>&1 | awk '
+        /^[A-Za-z-]+: / {
+          k=$0; sub(/:.*/, "", k); v=$0; sub(/^[A-Za-z-]+: /, "", v)
+          gsub(/\\/, "\\\\", v); gsub(/"/, "\\\"", v)
+          if (n++) printf ", "
+          printf "\"%s\": \"%s\"", k, v
+        }
+        END { printf "\n" }' | {
+        printf '{"name": %s, "fields": {' "$(jstr "$_n")"
+        cat
+        printf '}}\n'
+      }
+      ;;
+    installed)
+      if [ "$TEXT" = "1" ]; then opkg list-installed 2>&1 | head -60; return 0; fi
+      printf '{"installed": ['
+      opkg list-installed 2>/dev/null | awk -F' - ' '
+        NF >= 1 && $1 != "" {
+          if (n++) printf ","
+          v = (NF >= 2) ? $2 : ""
+          printf "\n  {\"name\": \"%s\", \"version\": \"%s\"}", $1, v
+        }
+        END { if (n) printf "\n" }'
+      printf ']}\n'
+      ;;
+    install | remove)
+      _n="$1"
+      [ -z "$_n" ] && die "用法: kwrt pkg $_sub <包名>"
+      require_yes "$@"
+      _out=$(opkg "$_sub" "$_n" 2>&1)
+      _rc=$?
+      if [ "$TEXT" = "1" ]; then printf '%s\n' "$_out"; return 0; fi
+      printf '{"action": %s, "package": %s, "ok": %s, "rc": %s, "output": %s}\n' \
+        "$(jstr "$_sub")" "$(jstr "$_n")" \
+        "$( [ "$_rc" = 0 ] && echo true || echo false )" "$_rc" \
+        "$(jstr "$(printf '%s' "$_out" | tail -3 | tr '\n' ' ')")"
+      ;;
+    *)
+      die "用法: kwrt pkg <update|search|installed|info|install|remove> ..."
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------- 写操作 ----
+
+cmd_wifi_reload() {
+  require_yes "$@"
+  _out=$(wifi reload 2>&1)
+  [ "$TEXT" = "1" ] && { printf 'wifi reload -> %s\n' "${_out:-done}"; return 0; }
+  printf '{"action": "wifi reload", "ok": true, "output": %s}\n' "$(jstr "$_out")"
+}
+
+cmd_reboot() {
+  require_yes "$@"
+  if [ "$TEXT" = "1" ]; then printf '正在重启…\n'; else printf '{"action": "reboot", "status": "rebooting"}\n'; fi
+  sync
+  (sleep 2; reboot) >/dev/null 2>&1 &
+  exit 0
+}
+
+# ---------------------------------------------------------------- 自检 ----
+
+cmd_doctor() {
+  _first=1
+  [ "$TEXT" = "1" ] && printf '%-26s %-6s %s\n' CHECK OK DETAIL
+  [ "$TEXT" = "1" ] || printf '{"checks": ['
+  _emit() { # _emit <name> <ok> <detail>
+    if [ "$TEXT" = "1" ]; then
+      printf '%-26s %-6s %s\n' "$1" "$2" "$3"
+    else
+      [ "$_first" = "1" ] || printf ','
+      _first=0
+      printf '\n  {"check": %s, "ok": %s, "detail": %s}' "$(jstr "$1")" "$2" "$(jstr "$3")"
+    fi
+  }
+
+  # opkg 源
+  _bad=$(grep -c '^src/gz' /etc/opkg/distfeeds.conf 2>/dev/null)
+  _dead=0
+  _detail=""
+  while read -r _l; do
+    case "$_l" in
+      src/gz*)
+        _u=$(printf '%s' "$_l" | awk '{print $3}')
+        _code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "$_u/Packages.gz" 2>/dev/null)
+        [ "$_code" = "200" ] || { _dead=$((_dead + 1)); _detail="$_detail $(basename "$_u")=$_code"; }
+        ;;
+    esac
+  done < /etc/opkg/distfeeds.conf 2>/dev/null
+  if [ "$_dead" = 0 ]; then
+    _emit "opkg-feeds" true "全部 $_bad 个源可访问"
+  else
+    _emit "opkg-feeds" false "$_dead 个源不可用:$_detail"
+  fi
+
+  # DNS
+  _ip=$(nslookup openwrt.org 2>/dev/null | awk '/^Address[ 0-9]*:/{v=$0; sub(/^Address[^:]*:[ \t]*/, "", v); if (v ~ /^[0-9.]+$/) print v}' | head -1)
+  [ -n "$_ip" ] && _emit "dns-resolve" true "openwrt.org -> $_ip" || _emit "dns-resolve" false "解析失败"
+
+  # WAN
+  _wan=$(iface_field wan '@["ipv4-address"][0].address')
+  [ -n "$_wan" ] && _emit "wan-connect" true "IP $_wan" || _emit "wan-connect" false "无 IP"
+
+  # 磁盘
+  _dl=$(disk_line)
+  _df=$(( $(printf '%s' "$_dl" | cut -d' ' -f3) / 1024 ))
+  _dpct=$(awk -v a="$(printf '%s' "$_dl" | cut -d' ' -f2)" -v t="$(printf '%s' "$_dl" | cut -d' ' -f1)" 'BEGIN{if(t>0) printf "%d", a*100/t; else print 0}')
+  [ "$_dpct" -lt 90 ] && _emit "overlay-disk" true "剩余 ${_df}MB (已用 $_dpct%)" || _emit "overlay-disk" false "空间不足, 已用 $_dpct%"
+
+  # 内存
+  _ma=$(mem_mb MemAvailable)
+  [ "${_ma:-0}" -gt 30 ] && _emit "memory-free" true "${_ma}MB" || _emit "memory-free" false "${_ma}MB 偏低"
+
+  # dropbear
+  _dr=$(ubus call service list '{"name":"dropbear"}' 2>/dev/null | jsonfilter -e '@.*.instances[*].running' 2>/dev/null)
+  case "$_dr" in *true*) _emit "ssh-dropbear" true "运行中" ;; *) _emit "ssh-dropbear" false "未运行" ;; esac
+
+  # 时间
+  _yr=$(date +%Y 2>/dev/null)
+  [ "${_yr:-0}" -gt 2023 ] && _emit "system-time" true "$(date '+%Y-%m-%d %H:%M:%S')" || _emit "system-time" false "时间异常: $(date 2>/dev/null)"
+
+  # 温度
+  _tc=$(temp_c)
+  if [ -n "$_tc" ]; then
+    _hot=$(awk -v t="$_tc" 'BEGIN{print (t>85)?1:0}')
+    [ "$_hot" = 0 ] && _emit "cpu-temp" true "${_tc}°C" || _emit "cpu-temp" false "${_tc}°C 偏高"
+  fi
+
+  # 关键命令行工具
+  _miss=""
+  for _c in ubus uci iwinfo jsonfilter uci nft curl; do
+    command -v "$_c" >/dev/null 2>&1 || _miss="$_miss $_c"
+  done
+  [ -z "$_miss" ] && _emit "deps" true "ubus/uci/iwinfo/jsonfilter/nft/curl 齐全" || _emit "deps" false "缺失:$_miss"
+
+  if [ "$TEXT" = "1" ]; then return 0; fi
+  printf '\n]}\n'
+}
+
+# ---------------------------------------------------------------- 直通 ----
+
+cmd_ubus() {
+  _obj="$1"; _meth="$2"; _args="$3"
+  [ -z "$_obj" ] && die "用法: kwrt ubus <对象> <方法> [JSON参数]  例: kwrt ubus system board"
+  [ -z "$_meth" ] && _meth="status"
+  if [ -z "$_args" ] || [ "$_args" = "-" ]; then
+    ubus call "$_obj" "$_meth"
+  else
+    ubus call "$_obj" "$_meth" "$_args"
+  fi
+}
+
+# ---------------------------------------------------------------- 帮助 ----
+
+cmd_help() {
+  cat <<'EOT'
+kwrt —— Kwrt / OpenWrt 管理 CLI (AI 友好, 默认输出 JSON)
+
+用法: kwrt [-t] [-y] <命令> [参数...]
+  -t, --text   人类可读文本（默认 JSON）
+  -y, --yes    确认执行写操作（也可 export KWRT_YES=1）
+  -v           版本    -h  帮助
+
+【只读 - 随时可用】
+  info                      系统/固件/资源总览
+  status                    运行状态速览
+  net                       所有网络接口（IP、流量、存活）
+  route                     路由表
+  clients                   在线终端（DHCP 租约 + 无线关联合并）
+  dhcp                      仅 DHCP 租约
+  wifi                      无线射频：SSID、信道、加密、终端数
+  services                  全部服务及运行/开机自启状态
+  logs [行数] [过滤词]       系统日志
+  firewall                  防火墙区域与规则数量
+  dns <域名>                 解析测试
+  ping <主机> [次数]         连通性测试
+  doctor                    环境自检（源/ DNS / WAN / 磁盘 / 温度）
+  uci show <配置>           导出配置（network/firewall/wireless...）
+  uci get <键>              读单个配置项
+  pkg update                更新软件源索引
+  pkg search <关键词>        搜索软件包
+  pkg installed             已安装列表
+  pkg info <包名>            包详情
+  ubus <对象> <方法> [参数]  直通 ubus，例: kwrt ubus system board
+
+【写操作 - 必须 -y】
+  uci set <键> <值>          改配置（之后需 commit）
+  uci delete <键>             删配置项
+  uci commit <配置>          提交并生效
+  uci revert <配置>          丢弃未提交改动
+  svc <restart|start|stop|enable|disable> <服务>
+  wifi reload               重载无线配置
+  pkg install|remove <包名>  安装/卸载软件包
+  reboot                    重启路由器
+
+示例:
+  kwrt info                          # JSON 总览
+  kwrt -t clients                    # 终端表格
+  kwrt logs 30 openclash             # 看 clash 日志
+  kwrt uci get network.lan.ipaddr
+  kwrt uci set network.lan.ipaddr=10.235.1.2 -y && kwrt uci commit network -y
+  kwrt reboot -y
+EOT
+}
+
+# ---------------------------------------------------------------- 入口 ----
+
+# 前置开关
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -t | --text) TEXT=1; shift ;;
+    -y | --yes) YES=1; shift ;;
+    -h | --help) cmd_help; exit 0 ;;
+    -v | --version) printf 'kwrt %s\n' "$KWRT_VERSION"; exit 0 ;;
+    --) shift; break ;;
+    -*) die "未知选项: $1（kwrt help 查看用法）" ;;
+    *) break ;;
+  esac
+done
+
+CMD="$1"
+[ $# -gt 0 ] && shift
+
+case "$CMD" in
+  info | sysinfo) cmd_info ;;
+  status | st) cmd_status ;;
+  net | iface | interfaces) cmd_net ;;
+  route | routes) cmd_route ;;
+  clients | stations | hosts) cmd_clients ;;
+  dhcp | leases) cmd_dhcp ;;
+  wifi | wireless)
+    case "$1" in
+      reload) cmd_wifi_reload "$@" ;;
+      *) cmd_wifi ;;
+    esac
+    ;;
+  services | svc-list) cmd_services ;;
+  svc | service) cmd_svc "$@" ;;
+  logs | log | logread) cmd_logs "$@" ;;
+  firewall | fw) cmd_firewall ;;
+  dns | resolve) cmd_dns "$@" ;;
+  ping) cmd_ping "$@" ;;
+  doctor | check | selfcheck) cmd_doctor ;;
+  uci) cmd_uci "$@" ;;
+  pkg | opkg) cmd_pkg "$@" ;;
+  ubus) cmd_ubus "$@" ;;
+  reboot) cmd_reboot "$@" ;;
+  help | -h | --help | "") cmd_help ;;
+  *) die "未知命令: $CMD（kwrt help 查看用法）" ;;
+esac
